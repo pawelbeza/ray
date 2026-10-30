@@ -1,5 +1,6 @@
 import ipaddress
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -337,6 +338,10 @@ class SandboxConfig:
             killed). None inherits the creating process's value. Set to 0
             to avoid inheriting a protected manager's OOM immunity.
             Lowering the value may require CAP_SYS_RESOURCE.
+        mounts: Host paths to show inside a gVisor sandbox, read-only, as
+            {sandbox path: host path}. Files added under a mounted host
+            directory later appear inside the sandbox too, so one sandbox can
+            be handed data after it starts; it can never write there.
     """
 
     image: str
@@ -359,6 +364,7 @@ class SandboxConfig:
     _ignore_cgroups: bool = field(default=False, repr=False, compare=False)
     disk: Union[str, int, float] = 0
     oom_score_adj: Optional[int] = None
+    mounts: Optional[Dict[str, str]] = None
 
     def __post_init__(self):
         self.cpu = 0.0 if self.cpu is None else float(self.cpu)
@@ -377,6 +383,9 @@ class SandboxConfig:
             or not -1000 <= self.oom_score_adj <= 1000
         ):
             raise ValueError("oom_score_adj must be an integer from -1000 to 1000.")
+        for target, source in (self.mounts or {}).items():
+            if not os.path.isabs(target) or not os.path.isabs(source):
+                raise ValueError("mounts must map absolute paths to absolute paths.")
         if self.network not in VALID_NETWORK_MODES:
             raise ValueError(
                 f"Invalid network mode '{self.network}'. "

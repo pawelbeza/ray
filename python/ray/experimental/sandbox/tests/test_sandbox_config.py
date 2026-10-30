@@ -68,6 +68,20 @@ def test_invalid_oom_score_adj_rejected(value):
         SandboxConfig(image="busybox:latest", oom_score_adj=value)
 
 
+@pytest.mark.parametrize(
+    "mounts",
+    [
+        {"data": "/srv/inbox"},
+        {"/data": "srv/inbox"},
+        {"data": "srv/inbox"},
+        {"/data": "/srv/inbox", "/other": ""},
+    ],
+)
+def test_mounts_require_absolute_paths(mounts: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="mounts must map absolute paths"):
+        SandboxConfig(image="busybox:latest", mounts=mounts)
+
+
 def test_invalid_network_mode_rejected():
     with pytest.raises(ValueError, match="network mode"):
         SandboxConfig(image="python:3.10-slim", network="bridge")

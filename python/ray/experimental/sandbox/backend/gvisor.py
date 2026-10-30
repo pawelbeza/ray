@@ -769,6 +769,18 @@ class GVisorSandboxBackend(BaseSandboxBackend):
         # Read back the final spec, as written to config.json.
         with open(config_json_path, encoding="utf-8") as f:
             spec = json.load(f)
+        for target, source in (config.mounts or {}).items():
+            spec.setdefault("mounts", []).append(
+                {
+                    "destination": target,
+                    "type": "bind",
+                    "source": source,
+                    "options": ["rbind", "ro"],
+                }
+            )
+        if config.mounts:
+            with open(config_json_path, "w", encoding="utf-8") as f:
+                json.dump(spec, f)
 
         # Boot the sandbox from a kernel overlay over its cached EROFS image
         # if its final spec needs one.

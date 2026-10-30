@@ -1072,6 +1072,49 @@ class _BundleRecordingImageManager:
         return path
 
 
+@pytest.mark.parametrize(
+    "mounts",
+    [None, {}, {"/data": "/srv/inbox", "/weights": "/srv/model.bin"}],
+)
+def test_prepare_bundle_readonly_host_mounts(tmp_path, monkeypatch, mounts) -> None:
+    existing_mount = {
+        "destination": "/existing",
+        "type": "bind",
+        "source": "/srv/existing",
+        "options": ["rbind", "ro"],
+    }
+
+    def transform(spec: dict) -> None:
+        spec["mounts"] = [existing_mount]
+
+    inspected_specs = []
+
+    def needs_overlay(spec: dict) -> bool:
+        inspected_specs.append(spec)
+        return False
+
+    monkeypatch.setattr(overlayfs, "needs_rootfs_overlay", needs_overlay)
+    manager = _BundleRecordingImageManager(image=str(tmp_path / "rootfs.erofs"))
+    backend = GVisorSandboxBackend(image_manager=manager)
+    config = GVisorSandboxConfig(
+        image="busybox:latest", mounts=mounts, _oci_spec_transform_fn=transform
+    )
+
+    assert backend._prepare_bundle(config, str(tmp_path), None, "/") is None
+
+    spec = json.loads((tmp_path / "config.json").read_text())
+    assert spec["mounts"] == [existing_mount] + [
+        {
+            "destination": target,
+            "type": "bind",
+            "source": source,
+            "options": ["rbind", "ro"],
+        }
+        for target, source in (mounts or {}).items()
+    ]
+    assert inspected_specs == [spec]
+
+
 def _stub_overlay_mount(monkeypatch, userns, image_mount_mode):
     """Have overlayfs sandboxes mount their rootfs this way, without probing."""
     monkeypatch.setattr(overlayfs.UserNamespaceType, "detect", lambda: userns)

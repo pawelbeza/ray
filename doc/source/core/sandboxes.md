@@ -409,6 +409,15 @@ res = ray.get(resumed_sb.exec.remote("cat /workspace/state.txt"))
 * **Compression:** `checkpoint(compression="flate-best-speed")` writes a smaller checkpoint. gVisor loads guest memory in the background only from uncompressed checkpoints, so a sandbox restored from a compressed one starts after all of its memory is loaded.
 :::
 
+### Share host files read-only
+
+`mounts` maps sandbox paths to host paths, for example
+`mounts={"/data": "/srv/inbox/sandbox-1"}`. gVisor mounts each one read-only, so code in
+the sandbox can read the files but can't change them. Files that appear under a mounted
+host directory after the sandbox starts show up inside it too. You can hand a running
+sandbox its inputs by hardlinking them in from a cache. Give each sandbox its own
+directory to avoid exposing another sandbox's inputs.
+
 ### Pass custom OCI configurations to gVisor
 
 For advanced workloads, you might need to configure low-level runtime options such as custom host mounts, Linux capabilities, or custom network and DNS settings. Use the `_oci_spec_transform_fn` parameter to inspect and modify the generated [Open Container Initiative (OCI) runtime specification](https://github.com/opencontainers/runtime-spec) dictionary before Ray passes it to gVisor (`runsc`).
