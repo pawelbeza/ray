@@ -332,6 +332,11 @@ class SandboxConfig:
             directory on the node instead of the workdir's host directory.
             In-memory mounts such as /dev/shm count toward the sandbox's
             memory instead.
+        oom_score_adj: Linux OOM-killer score adjustment for the sandbox's
+            host processes, from -1000 (exempt) to 1000 (most likely to be
+            killed). None inherits the creating process's value. Set to 0
+            to avoid inheriting a protected manager's OOM immunity.
+            Lowering the value may require CAP_SYS_RESOURCE.
     """
 
     image: str
@@ -353,6 +358,7 @@ class SandboxConfig:
     )
     _ignore_cgroups: bool = field(default=False, repr=False, compare=False)
     disk: Union[str, int, float] = 0
+    oom_score_adj: Optional[int] = None
 
     def __post_init__(self):
         self.cpu = 0.0 if self.cpu is None else float(self.cpu)
@@ -365,6 +371,12 @@ class SandboxConfig:
             raise ValueError("memory must be non-negative")
         if not self.image or not isinstance(self.image, str) or not self.image.strip():
             raise ValueError("A valid container image name must be specified.")
+        if self.oom_score_adj is not None and (
+            isinstance(self.oom_score_adj, bool)
+            or not isinstance(self.oom_score_adj, int)
+            or not -1000 <= self.oom_score_adj <= 1000
+        ):
+            raise ValueError("oom_score_adj must be an integer from -1000 to 1000.")
         if self.network not in VALID_NETWORK_MODES:
             raise ValueError(
                 f"Invalid network mode '{self.network}'. "

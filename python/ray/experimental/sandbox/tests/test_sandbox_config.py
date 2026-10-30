@@ -62,6 +62,12 @@ def test_capabilities_config():
     assert config.capabilities == ["CAP_CHOWN", "CAP_SETUID"]
 
 
+@pytest.mark.parametrize("value", [-1001, 1001, True, False, 0.0, "0"])
+def test_invalid_oom_score_adj_rejected(value):
+    with pytest.raises(ValueError, match="oom_score_adj"):
+        SandboxConfig(image="busybox:latest", oom_score_adj=value)
+
+
 def test_invalid_network_mode_rejected():
     with pytest.raises(ValueError, match="network mode"):
         SandboxConfig(image="python:3.10-slim", network="bridge")
