@@ -11,8 +11,10 @@ whether the worker has mount privileges or not (see ``UserNamespaceType.detect``
 and ``ImageMountMode.detect``). A worker with them mounts it in a per-sandbox
 mount namespace. There, the kernel's erofs driver mounts the image on a loop
 device, or ``erofsfuse`` mounts it through FUSE if that fails, and every file
-keeps its owner from the image either way. A worker without mount privileges
-uses ``erofsfuse`` to mount the image inside a per-sandbox user namespace.
+keeps its owner from the image either way. If neither is available,
+``fsck.erofs`` extracts a shared lower directory once. Each sandbox mounts it
+read-only beneath its own writable overlay. A worker without mount privileges
+uses FUSE or the extracted directory inside a per-sandbox user namespace.
 A worker running as root maps every id it has to itself in the new user
 namespace, so every file keeps its owner from the image. A worker running
 as any other user maps the subordinate ids getsubids or /etc/subuid and
@@ -31,6 +33,7 @@ lower layer.
 """
 
 import enum
+import fcntl
 import functools
 import logging
 import os
@@ -283,13 +286,14 @@ class IdMaps:
 class ImageMountMode(enum.Enum):
     """How an overlayfs sandbox's EROFS image gets mounted."""
 
-    # A sandbox's EROFS image is mounted in one of two ways, KERNEL or FUSE.
+    # A sandbox's EROFS image is mounted with KERNEL, FUSE, or DIRECTORY.
     # KERNEL mounts it with the kernel's erofs driver on a loop device, which
     # requires mount privileges. FUSE mounts it with erofsfuse, which runs as a
     # regular process and works in either user namespace. The detect method
     # determines which one applies to the sandboxes this worker creates.
     KERNEL = "kernel"
     FUSE = "fuse"
+    DIRECTORY = "directory"
 
     @classmethod
     @functools.lru_cache(maxsize=None)
@@ -304,42 +308,32 @@ class ImageMountMode(enum.Enum):
         Returns:
             ``ImageMountMode.KERNEL`` if it has mount privileges and the
             kernel's erofs driver can mount the image on a loop device, else
-            ``ImageMountMode.FUSE``.
+            ``ImageMountMode.FUSE``, or ``ImageMountMode.DIRECTORY`` if neither
+            kernel EROFS nor FUSE mounts work.
 
         Raises:
-            SandboxCreationError: If it can't mount the image either way.
+            SandboxCreationError: If it can't mount the image in any mode.
         """
-        # In the host's user namespace, the kernel's erofs driver should mount
-        # the EROFS image if it has sufficient privileges. If that fails,
-        # erofsfuse mounts it instead.
+        # Kernel EROFS mounts require the host user namespace; the other modes
+        # also work inside a private user namespace when its mount probe passes.
+        modes = [cls.FUSE, cls.DIRECTORY]
         if userns is UserNamespaceType.HOST:
-            # A kernel mount that hangs counts as one that failed, so the
-            # worker can still use erofsfuse.
+            modes.insert(0, cls.KERNEL)
+        failures = []
+        for mode in modes:
             try:
-                mounted, kernel_errstr = _probe_mount(
-                    UserNamespaceType.HOST, cls.KERNEL
-                )
+                mounted, error = _probe_mount(userns, mode)
             except SandboxCreationError as err:
-                mounted, kernel_errstr = False, str(err)
+                if mode is not cls.KERNEL:
+                    raise
+                # Preserve the fallback when a kernel mount probe hangs.
+                mounted, error = False, str(err)
             if mounted:
-                return cls.KERNEL
-            mounted, fuse_errstr = _probe_mount(UserNamespaceType.HOST, cls.FUSE)
-            if mounted:
-                return cls.FUSE
-            raise SandboxCreationError(
-                "Can't mount an overlayfs sandbox's rootfs on this node. "
-                f"Mounting with the kernel's erofs driver failed with: {kernel_errstr}."
-                f" Mounting with erofsfuse failed with: {fuse_errstr}"
-            )
-
-        # In a private user namespace, only erofsfuse can mount the image,
-        # since the kernel doesn't allow erofs mounts inside it.
-        mounted, fuse_errstr = _probe_mount(UserNamespaceType.PRIVATE, cls.FUSE)
-        if mounted:
-            return cls.FUSE
+                return mode
+            failures.append(f"{mode.value}: {error}")
         raise SandboxCreationError(
             "Can't mount an overlayfs sandbox's rootfs on this node. "
-            f"Mounting with erofsfuse failed with: {fuse_errstr}"
+            + "; ".join(failures)
         )
 
 
@@ -458,6 +452,11 @@ class RootfsOverlay:
                 ]
             case ImageMountMode.FUSE:
                 mount_image = [start_erofsfuse, wait_for_mount, check_mount]
+            case ImageMountMode.DIRECTORY:
+                mount_image = [
+                    'mount --bind "$image" "$tmpfs/lower"',
+                    'mount -o remount,bind,ro,nosuid "$tmpfs/lower"',
+                ]
             case _:
                 raise ValueError(f"Unknown image mount mode {self.image_mount_mode!r}")
 
@@ -723,6 +722,47 @@ def can_mount_rootfs_overlay() -> bool:
     return True
 
 
+def _extract_image_directory(image: str) -> str:
+    directory = f"{image}.rootfs"
+    with open(f"{directory}.lock", "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.isdir(directory):
+            return directory
+        if not shutil.which("fsck.erofs"):
+            raise SandboxCreationError(
+                "Install fsck.erofs to use an extracted EROFS lower directory "
+                "when kernel EROFS and FUSE mounts are unavailable."
+            )
+        with tempfile.TemporaryDirectory(
+            prefix=".erofs-extract-", dir=os.path.dirname(image)
+        ) as temporary:
+            extracted = os.path.join(temporary, "rootfs")
+            try:
+                # Without root, fsck.erofs otherwise applies this process's umask to
+                # every mode it extracts: /tmp would lose its world write bit.
+                result = subprocess.run(
+                    [
+                        "fsck.erofs",
+                        "--preserve-perms",
+                        f"--extract={extracted}",
+                        image,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise _ProbeTimeoutError(
+                    "Timed out extracting the EROFS image"
+                ) from error
+            if result.returncode:
+                raise SandboxCreationError(
+                    f"Could not extract EROFS image {image!r}: {result.stderr}"
+                )
+            os.rename(extracted, directory)
+    return directory
+
+
 def prepare(
     *,
     image: str,
@@ -763,6 +803,8 @@ def prepare(
         userns = UserNamespaceType.detect()
     if image_mount_mode is None:
         image_mount_mode = ImageMountMode.detect(userns)
+    if image_mount_mode is ImageMountMode.DIRECTORY:
+        image = _extract_image_directory(image)
 
     # Only a private user namespace maps the worker's subordinate ids.
     id_maps = None

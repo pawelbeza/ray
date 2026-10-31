@@ -540,6 +540,8 @@ def test_ci_worker_mounts_rootfs_overlays():
 def test_prepare_creates_the_overlay_dirs(
     tmp_path, monkeypatch, userns, image_mount_mode
 ):
+    extract = mock.Mock(return_value="/cache/rootfs.erofs.rootfs")
+    monkeypatch.setattr(overlayfs, "_extract_image_directory", extract)
     monkeypatch.setattr(overlayfs.IdMaps, "detect", lambda: _ID_MAPS)
     monkeypatch.setattr(overlayfs.UserNamespaceType, "detect", lambda: userns)
     monkeypatch.setattr(
@@ -554,7 +556,12 @@ def test_prepare_creates_the_overlay_dirs(
     assert overlay.tmpfs_dir == str(tmp_path / "overlayfs-tmpfs")
     assert os.path.isdir(overlay.tmpfs_dir)
     assert mountpoint.is_dir()
-    assert overlay.image == "/cache/rootfs.erofs"
+    if image_mount_mode is ImageMountMode.DIRECTORY:
+        extract.assert_called_once_with("/cache/rootfs.erofs")
+        assert overlay.image == "/cache/rootfs.erofs.rootfs"
+    else:
+        extract.assert_not_called()
+        assert overlay.image == "/cache/rootfs.erofs"
     assert overlay.userns is userns
     assert overlay.image_mount_mode is image_mount_mode
     # Only a new user namespace created for the sandbox maps subordinate ids.
@@ -741,6 +748,19 @@ def _stub_probe_mount(monkeypatch, errors):
             ImageMountMode.FUSE,
         ),
         (UserNamespaceType.PRIVATE, {}, ImageMountMode.FUSE),
+        (
+            UserNamespaceType.HOST,
+            {
+                (UserNamespaceType.HOST, ImageMountMode.KERNEL): "no kernel",
+                (UserNamespaceType.HOST, ImageMountMode.FUSE): "no fuse",
+            },
+            ImageMountMode.DIRECTORY,
+        ),
+        (
+            UserNamespaceType.PRIVATE,
+            {(UserNamespaceType.PRIVATE, ImageMountMode.FUSE): "no fuse"},
+            ImageMountMode.DIRECTORY,
+        ),
     ],
 )
 def test_image_mount_picks_how_to_mount_the_image(
@@ -770,25 +790,29 @@ def test_image_mount_reports_why_erofsfuse_failed(monkeypatch):
     """A failed mount's stderr says what broke, such as a missing tool."""
     fuse_error = "bash: line 1: erofsfuse: command not found"
     _stub_probe_mount(
-        monkeypatch, {(UserNamespaceType.PRIVATE, ImageMountMode.FUSE): fuse_error}
+        monkeypatch,
+        {
+            (UserNamespaceType.PRIVATE, ImageMountMode.FUSE): fuse_error,
+            (UserNamespaceType.PRIVATE, ImageMountMode.DIRECTORY): "no extraction",
+        },
     )
     with pytest.raises(SandboxCreationError, match=fuse_error):
         overlayfs.ImageMountMode.detect(UserNamespaceType.PRIVATE)
 
 
-def test_image_mount_reports_why_both_mounts_failed(monkeypatch):
+def test_image_mount_reports_why_all_mounts_failed(monkeypatch):
     _stub_probe_mount(
         monkeypatch,
         {
             (UserNamespaceType.HOST, ImageMountMode.KERNEL): "no kernel",
             (UserNamespaceType.HOST, ImageMountMode.FUSE): "no fuse",
+            (UserNamespaceType.HOST, ImageMountMode.DIRECTORY): "no extraction",
         },
     )
     with pytest.raises(SandboxCreationError) as err:
         overlayfs.ImageMountMode.detect(UserNamespaceType.HOST)
-    assert (
-        "driver failed with: no kernel. Mounting with erofsfuse failed with: no fuse"
-        in str(err.value)
+    assert "kernel: no kernel; fuse: no fuse; directory: no extraction" in str(
+        err.value
     )
 
 
@@ -853,6 +877,37 @@ def test_probe_that_hangs_raises_and_probes_again(monkeypatch, probe):
     finally:
         overlayfs._has_mount_privileges.cache_clear()
         overlayfs._probe_mount.cache_clear()
+
+
+def test_extracted_image_keeps_its_permissions(monkeypatch, tmp_path):
+    """Extraction preserves exact modes: without root, fsck.erofs otherwise applies
+    the umask, and a world-writable /tmp would lose its write bit."""
+    image = tmp_path / "rootfs.erofs"
+    image.write_bytes(b"")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        target = next(a.split("=", 1)[1] for a in args if a.startswith("--extract="))
+        os.makedirs(target)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(overlayfs.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(overlayfs.subprocess, "run", fake_run)
+    directory = overlayfs._extract_image_directory(str(image))
+    assert directory == f"{image}.rootfs" and os.path.isdir(directory)
+    assert calls and "--preserve-perms" in calls[0]
+    assert overlayfs._extract_image_directory(str(image)) == directory
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("userns", list(UserNamespaceType))
+def test_directory_lower_is_bind_mounted_read_only(userns):
+    overlay = _overlay(userns, ImageMountMode.DIRECTORY)
+    script = overlay._wrap_in_overlay_mount(["true"])[2]
+    assert 'mount --bind "$image" "$tmpfs/lower"' in script
+    assert 'mount -o remount,bind,ro,nosuid "$tmpfs/lower"' in script
+    assert "erofsfuse" not in script
 
 
 if __name__ == "__main__":
