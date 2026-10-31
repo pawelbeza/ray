@@ -1,4 +1,6 @@
+import concurrent.futures
 import contextlib
+import fcntl
 import hashlib
 import http.server
 import io
@@ -20,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ray.experimental.sandbox._internal import image_utils
+from ray.experimental.sandbox._internal import image_utils, layer_cache
 from ray.experimental.sandbox._internal.image_utils import (
     ROOTFS_IMAGE,
     _owner_filter,
@@ -1412,9 +1414,11 @@ def _serve_image(monkeypatch, layers, serve_blob=None):
         server.server_close()
 
 
-def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch):
-    """Three layers download at once, and the layers apply in manifest order
+@pytest.mark.parametrize("workers", [1, 3, 4])
+def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch, workers):
+    """The configured number of layers download at once, in manifest order
     even when later ones arrive first."""
+    monkeypatch.setenv("RAY_SANDBOX_LAYER_PULL_PARALLELISM", str(workers))
     layers = [
         _gz_layer(("f", b"1"), ("g", b"g")),
         _gz_layer(("f", b"2")),
@@ -1422,14 +1426,21 @@ def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch):
         _gz_layer(("h", b"h")),
         _gz_layer(("f", b"5")),
     ]
-    first_three = threading.Barrier(3, timeout=5)
+    first_downloads = threading.Barrier(workers, timeout=5)
+    lock = threading.Lock()
+    active = peak = 0
 
     def serve_blob(index, handler, blob):
-        if index < 3:
-            # Breaks, and fails the pull, unless all three run at once.
-            first_three.wait()
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        if index < workers:
+            first_downloads.wait()
         if index == 0:
             time.sleep(0.5)
+        with lock:
+            active -= 1
         _send(handler, blob)
 
     rootfs = tmp_path / "rootfs"
@@ -1441,6 +1452,7 @@ def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch):
     assert (rootfs / "f").read_bytes() == b"5"
     assert not (rootfs / "g").exists()
     assert (rootfs / "h").read_bytes() == b"h"
+    assert peak == workers
 
 
 def test_failed_layer_fails_the_pull_and_stops_other_downloads(tmp_path, monkeypatch):
@@ -1508,6 +1520,127 @@ def test_a_layer_cut_short_fails_the_pull(tmp_path, monkeypatch):
             image_utils._extract_image_layers(
                 image, str(rootfs), str(tmp_path), 30, str(tmp_path)
             )
+
+
+def test_layer_cache_reuses_layers_across_tags_and_rebuilds(tmp_path, monkeypatch):
+    layers = [_gz_layer(("a", b"a")), _gz_layer(("b", b"b"))]
+    requests = []
+
+    def serve_blob(index, handler, blob):
+        requests.append(index)
+        _send(handler, blob)
+
+    with _serve_image(monkeypatch, layers, serve_blob):
+        for tag in ("one", "two"):
+            image_dir = pull_and_extract_container_image(
+                f"busybox:{tag}", str(tmp_path)
+            )
+            assert _image_file(image_dir, "a") == b"a"
+            assert _image_file(image_dir, "b") == b"b"
+        shutil.rmtree(image_dir)
+        pull_and_extract_container_image("busybox:two", str(tmp_path))
+    assert sorted(requests) == [0, 1]
+
+
+@pytest.mark.parametrize("processes", [False, True])
+def test_layer_cache_concurrent_pulls_download_once(tmp_path, monkeypatch, processes):
+    layer = _gz_layer(("a", b"a"))
+    digest = f"sha256:{hashlib.sha256(layer).hexdigest()}"
+    requests = []
+    start = threading.Barrier(4, timeout=5)
+
+    def serve_blob(index, handler, blob):
+        requests.append(index)
+        _send(handler, blob)
+
+    with _serve_image(monkeypatch, [layer], serve_blob):
+        base = os.environ["RAY_SANDBOX_REGISTRY_MIRROR"]
+
+        def pull() -> bytes:
+            start.wait()
+            if processes:
+                return subprocess.check_output(
+                    [
+                        sys.executable,
+                        "-c",
+                        """
+import importlib.util
+import sys
+import urllib.request
+spec = importlib.util.spec_from_file_location("layer_cache", sys.argv[1])
+cache = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cache)
+with cache.fetch_blobs(
+    sys.argv[2], [sys.argv[3]], lambda d: urllib.request.Request(sys.argv[4]), 30
+) as blobs:
+    sys.stdout.buffer.write(blobs[0].read())
+""",
+                        layer_cache.__file__,
+                        str(tmp_path),
+                        digest,
+                        f"{base}/v2/library/busybox/blobs/{digest}",
+                    ],
+                    timeout=30,
+                )
+            with layer_cache.fetch_blobs(
+                str(tmp_path),
+                [digest, digest],
+                lambda d: image_utils._registry_request(
+                    f"{base}/v2/library/busybox/blobs/{d}", {}
+                ),
+                30,
+            ) as blobs:
+                assert blobs[0] is blobs[1]
+                return blobs[0].read()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: pull(), range(4)))
+    assert results == [layer] * 4
+    assert requests == [0]
+
+
+def test_layer_cache_rejects_wrong_digest_and_cleans_partial(tmp_path, monkeypatch):
+    layer = _gz_layer(("a", b"a"))
+
+    def serve_blob(index, handler, blob):
+        _send(handler, _gz_layer(("a", b"wrong")))
+
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    with _serve_image(monkeypatch, [layer], serve_blob) as image:
+        with pytest.raises(SandboxCreationError, match="failed verification"):
+            image_utils._extract_image_layers(
+                image, str(rootfs), str(tmp_path), 30, str(tmp_path)
+            )
+    directory = tmp_path / "blobs" / "sha256"
+    assert not list(directory.glob(".partial-*"))
+    assert all(path.name.endswith(".lock") for path in directory.iterdir())
+    assert not list(rootfs.iterdir())
+
+
+def test_layer_cache_eviction_preserves_kept_locked_and_open_blobs(tmp_path):
+    paths = []
+    digests = [f"sha256:{i:064x}" for i in range(4)]
+    for i, digest in enumerate(digests):
+        path = layer_cache.blob_path(str(tmp_path), digest)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as blob:
+            blob.write(bytes([i]) * 10)
+        os.utime(path, (i + 1, i + 1))
+        paths.append(path)
+    with open(paths[0], "rb") as reader, open(paths[1] + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        layer_cache.evict_least_recently_used_blobs(
+            str(tmp_path), 20, keep=[digests[2]]
+        )
+        assert reader.read() == b"\0" * 10
+        assert [os.path.exists(path) for path in paths] == [False, True, True, False]
+
+
+@pytest.mark.parametrize("digest", ["sha256:../escape", "sha256:" + "a" * 64 + "\n"])
+def test_layer_cache_rejects_invalid_digest(tmp_path, digest):
+    with pytest.raises(SandboxCreationError, match="Unsupported layer digest"):
+        layer_cache.blob_path(str(tmp_path), digest)
 
 
 def test_extract_tar_layer_reads_a_layer_once(tmp_path):
