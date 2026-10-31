@@ -5,9 +5,12 @@ These pin that ``create()`` arguments actually reach the backend's
 shipped behind a green suite.
 """
 
+import asyncio
 import os
+import subprocess
 import sys
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -32,8 +35,32 @@ class _FakeBackend:
     def delete_sandbox(self, sandbox_id):
         self.deleted.append(sandbox_id)
 
-    def exec_command(self, sandbox_id, command, timeout=None, cwd=None, env=None):
-        return ExecResult(exit_code=0, stdout="", stderr="", duration_seconds=0.0)
+    def exec_command(
+        self,
+        sandbox_id,
+        command,
+        timeout=None,
+        cwd=None,
+        env=None,
+        shell=None,
+        user=None,
+        combine_output=False,
+    ):
+        self.exec_options = {
+            "timeout": timeout,
+            "cwd": cwd,
+            "env": env,
+            "shell": shell,
+            "user": user,
+            "combine_output": combine_output,
+        }
+        return ExecResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.0,
+            output=b"\xff" if combine_output else None,
+        )
 
     def write_file(self, sandbox_id, path, content):
         pass
@@ -120,6 +147,135 @@ def test_create_forwards_config_fields_to_backend():
     assert config.readonly is False
     assert config.shell == "/bin/bash"
     assert config.oom_score_adj == 0
+
+
+@pytest.mark.parametrize("combine_output", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_exec_forwards_options_to_backend(combine_output: bool, asynchronous: bool):
+    runtime = _fake_runtime()
+    options = {
+        "timeout": 5,
+        "cwd": "/workspace",
+        "env": {"A": "1"},
+        "shell": "/bin/sh",
+        "user": "1000",
+        "combine_output": combine_output,
+    }
+    if asynchronous:
+        result = asyncio.run(runtime.exec_async("sandbox", "true", **options))
+    else:
+        result = runtime.exec("sandbox", "true", **options)
+    assert runtime._backend.exec_options == options
+    assert result.output == (b"\xff" if combine_output else None)
+
+
+def _fake_running_backend(tmp_path):
+    from ray.experimental.sandbox.backend.gvisor import GVisorSandboxBackend
+    from ray.experimental.sandbox.config import SandboxConfig
+
+    backend = GVisorSandboxBackend(image_manager=_FakeImageManager())
+    backend._sandbox_metadata["sandbox"] = {
+        "config": SandboxConfig(image="fake:latest"),
+        "root_dir": str(tmp_path),
+        "cwd": "/",
+        "status": SandboxStatus.RUNNING,
+    }
+    return backend
+
+
+@pytest.mark.parametrize("combine_output", [False, True])
+def test_gvisor_exec_binary_output(tmp_path, monkeypatch, combine_output: bool):
+    backend = _fake_running_backend(tmp_path)
+    popen = subprocess.Popen
+
+    def local_popen(args, **kwargs):
+        return popen(
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'out\\xff'); "
+                "os.write(2, b'err\\xfe'); os.write(1, b'end')",
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", local_popen)
+    result = backend.exec_command("sandbox", ["true"], combine_output=combine_output)
+    assert result.exit_code == 0
+    if combine_output:
+        assert result.output == b"out\xfferr\xfeend"
+        assert result.stdout == result.stderr == ""
+    else:
+        assert result.output is None
+        assert result.stdout == "out\ufffdend"
+        assert result.stderr == "err\ufffd"
+
+
+@pytest.mark.parametrize("combine_output", [False, True])
+def test_gvisor_exec_timeout_closes_available_pipes(
+    tmp_path, monkeypatch, combine_output: bool
+):
+    from ray.experimental.sandbox.exceptions import SandboxTimeoutError
+
+    backend = _fake_running_backend(tmp_path)
+    proc = Mock()
+    proc.stderr = None if combine_output else Mock()
+    proc.communicate.side_effect = subprocess.TimeoutExpired("runsc", 1)
+    monkeypatch.setattr(subprocess, "Popen", Mock(return_value=proc))
+    kill_exec = Mock()
+    monkeypatch.setattr(backend, "_kill_exec", kill_exec)
+    with pytest.raises(SandboxTimeoutError):
+        backend.exec_command(
+            "sandbox", ["true"], timeout=1, combine_output=combine_output
+        )
+    kill_exec.assert_called_once()
+    proc.kill.assert_called_once()
+    proc.stdout.close.assert_called_once()
+    if not combine_output:
+        proc.stderr.close.assert_called_once()
+    proc.wait.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "append,returncodes",
+    [(False, [0]), (False, [127, 0]), (True, [0]), (False, [1, 1])],
+)
+def test_gvisor_write_fast_path_and_fallback(
+    tmp_path, monkeypatch, append: bool, returncodes: list
+):
+    from ray.experimental.sandbox.exceptions import SandboxError
+
+    backend = _fake_running_backend(tmp_path)
+    commands = []
+    processes = []
+
+    def fake_popen(args, **kwargs):
+        commands.append(args)
+        proc = Mock(returncode=returncodes[len(processes)])
+        proc.communicate.return_value = (b"", b"write denied")
+        processes.append(proc)
+        return proc
+
+    wrap = Mock(side_effect=lambda meta, args: ["wrapped", *args])
+    monkeypatch.setattr(backend, "_wrap_workload", wrap)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    path = "/workspace/nested/file with spaces"
+    if returncodes[-1] != 0:
+        with pytest.raises(SandboxError, match="write denied"):
+            backend.write_file("sandbox", path, "caf\u00e9", append=append)
+    else:
+        backend.write_file("sandbox", path, "caf\u00e9", append=append)
+    assert len(commands) == len(returncodes)
+    assert wrap.call_count == len(commands)
+    for command, proc in zip(commands, processes):
+        assert command[0] == "wrapped"
+        assert command[-1] == path
+        proc.communicate.assert_called_once_with(input=b"caf\xc3\xa9")
+    if not append:
+        assert commands[0][-6:] == ["install", "-D", "-m", "0644", "/dev/stdin", path]
+    if append or len(commands) > 1:
+        assert "/bin/sh" in commands[-1]
+        assert ("cat >>" if append else "cat >") in commands[-1][-3]
 
 
 def test_ttl_is_enforced_by_the_runtime():
