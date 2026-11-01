@@ -6,12 +6,14 @@ shipped behind a green suite.
 """
 
 import os
+import subprocess
 import sys
 import time
 
 import pytest
 
 from ray.experimental.sandbox.backend.base import ExecResult, SandboxStatus
+from ray.experimental.sandbox.exceptions import SandboxError
 from ray.experimental.sandbox.runtime import SandboxRuntime
 
 
@@ -118,6 +120,53 @@ def test_create_forwards_config_fields_to_backend():
     assert config.rootless is True
     assert config.readonly is False
     assert config.shell == "/bin/bash"
+
+
+def _fake_running_backend(tmp_path):
+    from ray.experimental.sandbox.backend.gvisor import GVisorSandboxBackend
+    from ray.experimental.sandbox.config import SandboxConfig
+
+    backend = GVisorSandboxBackend(image_manager=_FakeImageManager())
+    backend._sandbox_metadata["sandbox"] = {
+        "config": SandboxConfig(image="fake:latest"),
+        "root_dir": str(tmp_path),
+        "cwd": "/",
+        "status": SandboxStatus.RUNNING,
+    }
+    return backend
+
+
+@pytest.mark.parametrize("paused", [False, True])
+@pytest.mark.parametrize("failure", [None, "error", "timeout"])
+def test_export_rootfs_preserves_pause_state(tmp_path, monkeypatch, paused, failure):
+    backend = _fake_running_backend(tmp_path)
+    initial = SandboxStatus.PAUSED if paused else SandboxStatus.RUNNING
+    backend._sandbox_metadata["sandbox"]["status"] = initial
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs["timeout"]))
+        if "tar" in args:
+            assert backend.get_status("sandbox") == SandboxStatus.PAUSED
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(args, 7)
+            return subprocess.CompletedProcess(
+                args, 1 if failure else 0, stdout="", stderr="export failed"
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    if failure:
+        expected = subprocess.TimeoutExpired if failure == "timeout" else SandboxError
+        with pytest.raises(expected):
+            backend.export_rootfs_changes("sandbox", str(tmp_path / "rootfs.tar"), 7)
+    else:
+        backend.export_rootfs_changes("sandbox", str(tmp_path / "rootfs.tar"), 7)
+    assert backend.get_status("sandbox") == initial
+    assert [args[args.index("tar") :] for args, _ in calls if "tar" in args] == [
+        ["tar", "rootfs-upper", "--file", str(tmp_path / "rootfs.tar"), "sandbox"]
+    ]
+    assert [timeout for _, timeout in calls] == ([7] if paused else [60, 7, 60])
 
 
 def test_ttl_is_enforced_by_the_runtime():
