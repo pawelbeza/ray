@@ -910,7 +910,7 @@ For defense in depth, turn on Ray's token authentication with `RAY_AUTH_MODE=tok
 
 Provision a writable cgroup v2 subtree on each eligible worker node and set `RAY_SANDBOX_CGROUP_PATH` to its mount path. Enable the `cpu` and `memory` controllers in the subtree's `cgroup.subtree_control`, and keep processes in separate leaf cgroups. Ray requires `cgroup.kill` support and permission to write it. Grant the worker permission to create child cgroups and to move its launch helpers from the worker cgroup into them. See [Linux cgroup v2 delegation](https://docs.kernel.org/admin-guide/cgroup-v2.html#delegation) for the directory, controller, and common-ancestor permissions.
 
-Every positive `cpu` or `memory` limit requires this configuration. Without it, creation fails before the image pull. Ray writes `cpu.max`, `memory.max`, and `memory.swap.max` before starting runsc or the network wrapper. Fractional CPU limits remain bandwidth limits: `cpu=0.25` gives the whole sandbox one quarter of a CPU. A sandbox with a CPU limit also runs on `max(2, ceil(cpu))` of the pool's CPUs, which Ray picks so that sandboxes spread across the pool. gVisor sizes a sandbox's CPUs from the CPUs it can run on, so `nproc`, and tools that size worker pools by CPU count, see the limit instead of the whole node. Two is gVisor's minimum. Memory limits include Sentry, Gofer, and network helpers, and limited sandboxes can't use swap. Memory exhaustion terminates the sandbox and leaves its hosting Ray worker alive.
+Every positive `cpu` or `memory` limit requires this configuration unless you use [Slurm job steps](#cap-sandboxes-with-slurm-job-steps). Without either, creation fails before the image pull. Ray writes `cpu.max`, `memory.max`, and `memory.swap.max` before starting runsc or the network wrapper. Fractional CPU limits remain bandwidth limits: `cpu=0.25` gives the whole sandbox one quarter of a CPU. A sandbox with a CPU limit also runs on `max(2, ceil(cpu))` of the pool's CPUs, which Ray picks so that sandboxes spread across the pool. gVisor sizes a sandbox's CPUs from the CPUs it can run on, so `nproc`, and tools that size worker pools by CPU count, see the limit instead of the whole node. Two is gVisor's minimum. Memory limits include Sentry, Gofer, and network helpers, and limited sandboxes can't use swap. Memory exhaustion terminates the sandbox and leaves its hosting Ray worker alive.
 
 Ray owns the cgroup, so `--ignore-cgroups` disables runsc's own cgroup management without disabling Ray's limits. `RAY_SANDBOX_IGNORE_CGROUPS=1` can't bypass a requested limit. Passing zero means no limit. Passing `cpu=None` to the sandbox actor derives a limit from its assigned Ray CPU resources.
 
@@ -919,6 +919,28 @@ Ray picks a sandbox's CPUs under a file lock in `/tmp/ray/sandbox` and records t
 :::{note}
 A CPU limit caps what a sandbox uses but doesn't reserve CPU time for it. Other work on the node still affects how long a task takes, so resource limits don't guarantee a wall-clock deadline.
 :::
+
+### Cap sandboxes with Slurm job steps
+
+On Slurm nodes where the worker can't write cgroups, set `RAY_SANDBOX_SLURM_STEPS=1`
+on the worker in a Slurm job. Ray runs each sandbox in its own `srun --overlap`
+step on the worker's node. The step uses the sandbox's name, rounds `cpu` up to
+at least one core for `--cpus-per-task`, and converts `memory` to MiB for `--mem`.
+The step's cgroups enforce these limits. Ray doesn't allocate a delegated cgroup,
+and runsc ignores cgroups. Unlike delegated cgroup limits, fractional CPU
+values round up to whole cores.
+
+A GPU sandbox's step requests the job's GPUs on the node with `--gres=gpu:<count>`.
+The sandbox still sees only its assigned GPUs. Ray removes inherited CPU binding
+and GPU request variables from the step's environment to avoid conflicting Slurm
+requests. An out-of-memory kill terminates the sandbox's step.
+`get_termination_reason` reports `Sandbox exceeded its enforced memory limit`,
+and subsequent operations raise `SandboxError`. Deleting the sandbox cancels its step.
+
+For a worker inside a Pyxis or enroot container, the host step re-enters the
+worker's user and mount namespaces so the sandbox sees the worker's files.
+Provide the host's `srun`, `squeue`, and `scancel`, Slurm's configuration and
+plugins, and the munge socket inside the container.
 
 ## HTTP API service
 
@@ -1154,7 +1176,7 @@ For detailed signatures, parameters, and return types, see {ref}`ray-sandbox-ref
 * **`gVisor container failed to start: WARNING: host page size mismatch - running on non-4K host`**: The node's kernel uses 64 KiB pages, and gVisor's prebuilt `runsc` only supports 4 KiB pages. Build `runsc` from source with `--define=pagesize=64k` (see [Requirements](#requirements)).
 * **`mkfs.erofs` not found or too old**: Sandbox creation fails with an error naming erofs-utils 1.7. Install erofs-utils 1.7 or later on every worker node; Ubuntu 22.04's packaged 1.4 predates the `--tar` option Ray relies on.
 * **`mkfs.erofs failed: ... invalid block size 65536`**: The node's kernel uses 64 KiB pages, and its erofs-utils package can only build 4 KiB blocks. Build erofs-utils from source with `./configure MAX_BLOCK_SIZE=65536` (see [Requirements](#requirements)).
-* **cgroup or permission errors**: Keep `rootless=True` for unprivileged runsc. Positive CPU or memory limits also require a delegated cgroup v2 subtree configured through `RAY_SANDBOX_CGROUP_PATH`. `RAY_SANDBOX_IGNORE_CGROUPS=1` disables runsc's cgroup setup but doesn't remove this requirement. See [Enforce resource limits](#enforce-resource-limits).
+* **cgroup or permission errors**: Keep `rootless=True` for unprivileged runsc. Positive CPU or memory limits also require a delegated cgroup v2 subtree configured through `RAY_SANDBOX_CGROUP_PATH` or [Slurm job steps](#cap-sandboxes-with-slurm-job-steps). `RAY_SANDBOX_IGNORE_CGROUPS=1` disables runsc's cgroup setup but doesn't remove this requirement. See [Enforce resource limits](#enforce-resource-limits).
 * **Node disk filling up with images**: The image cache is capped at half of its filesystem by default. Lower the cap with `RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES` (bytes) on worker nodes, or move the cache to a larger volume. Images that running sandboxes use are never evicted, so many concurrent sandboxes on distinct large images still need that much disk.
 * **Image pull failures**: Verify that the node can reach the container registry, such as Docker Hub or GHCR, or pre-populate the image cache directory at `/tmp/ray/sandbox/images`. When many nodes pull large images at once, Docker Hub's anonymous rate limits are a likely cause. See [Route Docker Hub pulls through a mirror](#route-docker-hub-pulls-through-a-mirror). An error that a registry requires credentials, or that a `docker-credential-*` helper failed, points at the node's Docker configuration. See [Pull from private registries](#pull-from-private-registries).
 * **`slirp4netns` not found for `network="public"`**: Install the slirp4netns package (or a [static build](https://github.com/rootless-containers/slirp4netns/releases)) on worker nodes.

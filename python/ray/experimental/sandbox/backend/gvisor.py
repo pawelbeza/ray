@@ -30,7 +30,7 @@ from typing import (
 )
 
 import ray
-from ray.experimental.sandbox._internal import cdi, egress_guard, overlayfs
+from ray.experimental.sandbox._internal import cdi, egress_guard, overlayfs, slurm_steps
 from ray.experimental.sandbox._internal.cgroup import (
     SandboxCgroup,
     SandboxCgroupManager,
@@ -600,6 +600,8 @@ class GVisorSandboxBackend(BaseSandboxBackend):
         self, config: SandboxConfig
     ) -> Optional[SandboxCgroupManager]:
         """Return the cgroup manager for a sandbox with limits, or None."""
+        if slurm_steps.enabled():
+            return None
         memory = parse_memory_bytes(config.memory) or 0
         if config.cpu <= 0 and memory <= 0:
             return None
@@ -936,6 +938,8 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             # network="public", the namespace holder and slirp4netns.
             "proc": proc,
             "stderr_file": stderr_file,
+            "stderr_log_path": os.path.join(root_dir, "runsc.stderr.log"),
+            "slurm_step": slurm_steps.enabled(),
             "owner_file": owner_file,
             "status": SandboxStatus.RUNNING,
         }
@@ -980,6 +984,15 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             rootfs_overlay=rootfs_overlay,
         )
         run_args = wrap_command(run_args, cgroup, config.oom_score_adj)
+        use_slurm_step = slurm_steps.enabled()
+        if use_slurm_step:
+            run_args = slurm_steps.step_command(
+                run_args,
+                name=sandbox_id,
+                cpu=config.cpu,
+                memory=parse_memory_bytes(config.memory),
+                gpus=bool(config.gpu_ids),
+            )
 
         stderr_log_path = os.path.join(root_dir, "runsc.stderr.log")
         stderr_file = open(stderr_log_path, "w+", encoding="utf-8")
@@ -1074,6 +1087,8 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             # and everything it started.
             self._delete_container_state(config, sandbox_id)
             self._terminate_tree(proc)
+            if use_slurm_step:
+                slurm_steps.cancel(sandbox_id)
             stderr_file.close()
             raise
         return proc, stderr_file
@@ -1100,6 +1115,8 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             # shell still stops and reaps the namespace holder and slirp4netns.
             if proc:
                 self._terminate_tree(proc)
+            if meta.get("slurm_step"):
+                slurm_steps.cancel(sandbox_id)
 
             if stderr_file:
                 try:
@@ -1413,6 +1430,14 @@ class GVisorSandboxBackend(BaseSandboxBackend):
 
         # Commands may print bytes that aren't UTF-8, and decoding them
         # strictly would fail the whole exec.
+        if meta.get("slurm_step") and proc.returncode == 128:
+            # Slurm writes its OOM report when the launch step exits.
+            launch_proc = meta.get("proc")
+            if launch_proc is not None:
+                try:
+                    launch_proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    pass
         return ExecResult(
             exit_code=proc.returncode,
             stdout="" if combine_output else stdout.decode("utf-8", errors="replace"),
@@ -1567,6 +1592,10 @@ class GVisorSandboxBackend(BaseSandboxBackend):
         """Get operational status of the gVisor sandbox."""
         meta = self._sandbox_metadata.get(sandbox_id)
         if meta and os.path.exists(meta["root_dir"]):
+            if meta.get("slurm_step") and slurm_steps.oom_killed(
+                meta["stderr_log_path"]
+            ):
+                return SandboxStatus.TERMINATED
             proc = meta.get("proc")
             if proc is not None and proc.poll() is not None:
                 return SandboxStatus.TERMINATED
@@ -1576,6 +1605,10 @@ class GVisorSandboxBackend(BaseSandboxBackend):
     def get_termination_reason(self, sandbox_id: str) -> Optional[str]:
         meta = self._sandbox_metadata.get(sandbox_id)
         if meta is not None and self.get_status(sandbox_id) == SandboxStatus.TERMINATED:
+            if meta.get("slurm_step") and slurm_steps.oom_killed(
+                meta["stderr_log_path"]
+            ):
+                return "Sandbox exceeded its enforced memory limit"
             cgroup = meta.get("cgroup")
             return (
                 cgroup.termination_reason() if cgroup is not None else None
@@ -1870,6 +1903,8 @@ class GVisorSandboxBackend(BaseSandboxBackend):
             except subprocess.TimeoutExpired:
                 pass
             self._terminate_tree(proc)
+        if meta.get("slurm_step"):
+            slurm_steps.cancel(sandbox_id)
         self._delete_container_state(meta["config"], sandbox_id)
         stderr_file = meta.get("stderr_file")
         if stderr_file is not None:
@@ -2131,6 +2166,7 @@ class GVisorSandboxBackend(BaseSandboxBackend):
                 or (parse_memory_bytes(config.memory) or 0) > 0
                 or getattr(config, "_ignore_cgroups", False)
                 or os.environ.get("RAY_SANDBOX_IGNORE_CGROUPS") == "1"
+                or slurm_steps.enabled()
             ),
         )
 
@@ -2443,6 +2479,9 @@ class GVisorSandboxBackend(BaseSandboxBackend):
                     "image": config.image,
                     "rootless": "--rootless" in runsc_args,
                     "ignore_cgroups": "--ignore-cgroups" in runsc_args,
+                    "slurm_job_id": (
+                        os.environ["SLURM_JOB_ID"] if slurm_steps.enabled() else None
+                    ),
                     "cpus": cpus or [],
                 },
                 owner_file,
@@ -2564,6 +2603,11 @@ class GVisorSandboxBackend(BaseSandboxBackend):
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     pass
+            if (
+                slurm_steps.enabled()
+                and owner.get("slurm_job_id") == os.environ["SLURM_JOB_ID"]
+            ):
+                slurm_steps.cancel(sandbox_id)
             # A sandbox with limits ran in a cgroup of its own. One that
             # can't be removed raises, which leaves the bundle to a later pass.
             SandboxCgroupManager().remove(sandbox_id)
