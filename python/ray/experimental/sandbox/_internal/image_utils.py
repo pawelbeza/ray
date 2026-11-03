@@ -1,3 +1,5 @@
+import concurrent.futures
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -13,13 +15,14 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
 from functools import lru_cache
-from typing import BinaryIO, Deque, Dict, List, Optional, Tuple, Union
+from typing import BinaryIO, Deque, Dict, Iterator, List, Optional, Tuple, Union
 
 from ray.experimental.sandbox._internal import docker_config, layer_cache
 from ray.experimental.sandbox.exceptions import SandboxCreationError
@@ -40,6 +43,8 @@ ROOTFS_IMAGE = "rootfs.erofs"
 _EXTRACT_FORMAT = 3
 # The erofs-utils release that added ``mkfs.erofs --tar``.
 _MKFS_EROFS_MIN_VERSION = "1.7"
+# How many of an image's layers download at once, as in Docker.
+_LAYER_DOWNLOADS = 3
 
 
 def _registry_request(
@@ -844,7 +849,7 @@ _USERS_SUBDIR = ".users"
 
 
 def image_cache_max_bytes(images_dir: str) -> int:
-    """Return the image cache size cap in bytes, or 0 for no cap.
+    """Return the combined image and layer cache size cap, or 0 for no cap.
 
     ``RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES`` sets the cap explicitly; ``0``
     disables eviction. Unset, the cap defaults to half of the filesystem
@@ -1004,17 +1009,14 @@ def evict_least_recently_used_images(
     keep: Optional[str] = None,
     min_free_bytes: int = 0,
 ) -> None:
-    """Evict least-recently-extracted images until the cache fits ``max_bytes``
+    """Evict cached layers, then images until the cache fits ``max_bytes``
     and its filesystem has ``min_free_bytes`` free.
 
-    Nodes cache every image they ever ran, so without a cap a long-lived
-    node eventually fills its disk, and the cache also gives way when
-    sandboxes' overlays or anything else fill it. Candidates are fully extracted images
-    (``.extracted`` marker present) and ``<name>.tar`` archives left behind
-    by earlier Ray versions, oldest first. An image is skipped when a live sandbox uses it, when its
-    per-image lock is held (a pull in progress), or when it is ``keep``. The
-    in-use check is repeated under the lock, which is also where pulls
-    register their users, so a marked image is never removed.
+    Layers go first in last-used order, followed by fully extracted images
+    (``.extracted`` marker present) and legacy tar archives in extraction
+    order. Locked entries, pinned images and ``keep`` are skipped. Image pins
+    are rechecked under the same lock that pulls hold when registering users.
+    Open layer files remain readable after eviction.
 
     Args:
         images_dir: Root image cache directory.
@@ -1026,7 +1028,11 @@ def evict_least_recently_used_images(
         names = os.listdir(images_dir)
     except OSError:
         return
-    entries = []  # (mtime, name, image_dir or None, tar_path, size)
+    # (priority, mtime, name, image_dir or None, file_path, size)
+    entries = [
+        (0, mtime, name, None, os.path.join(images_dir, name), size)
+        for mtime, name, size in layer_cache.cached_blobs(images_dir)
+    ]
     for name in names:
         path = os.path.join(images_dir, name)
         if name.endswith(".tar") and os.path.isfile(path):
@@ -1036,6 +1042,7 @@ def evict_least_recently_used_images(
                 try:
                     entries.append(
                         (
+                            1,
                             os.path.getmtime(path),
                             stem,
                             None,
@@ -1060,11 +1067,11 @@ def evict_least_recently_used_images(
             continue  # Concurrently deleted; keep going.
         tar_path = os.path.join(images_dir, f"{name}.tar")
         size = _dir_size_bytes(path) + _file_size_bytes(tar_path)
-        entries.append((mtime, name, path, tar_path, size))
+        entries.append((1, mtime, name, path, tar_path, size))
 
     total = sum(entry[-1] for entry in entries)
     free = _free_bytes(images_dir)
-    for _, name, img_dir, tar_path, size in sorted(entries):
+    for priority, mtime, name, img_dir, tar_path, size in sorted(entries):
         if (max_bytes is None or total <= max_bytes) and (
             free is None or free >= min_free_bytes
         ):
@@ -1078,6 +1085,12 @@ def evict_least_recently_used_images(
                 # A pull may have registered a user since the scan.
                 if img_dir is not None and _has_users(img_dir):
                     continue
+                if img_dir is None:
+                    try:
+                        if os.path.getmtime(tar_path) != mtime:
+                            continue
+                    except FileNotFoundError:
+                        pass  # Count an entry another pull already evicted.
                 # Another pull may have evicted it since the scan.
                 if img_dir is not None and os.path.isdir(img_dir):
                     _rename_for_deletion(img_dir)
@@ -1089,10 +1102,16 @@ def evict_least_recently_used_images(
             continue  # Locked by an in-progress pull; try the next one.
         # Delete the image once its lock is free, so a pull of it doesn't wait
         # for the delete.
-        _remove_stale_deletions(images_dir)
+        if img_dir is not None:
+            _remove_stale_deletions(images_dir)
         total -= size
         free = _free_bytes(images_dir)
-        logger.info("Evicted cached sandbox image %s (%d bytes)", name, size)
+        logger.info(
+            "Evicted cached sandbox %s %s (%d bytes)",
+            "layer" if priority == 0 else "image",
+            name,
+            size,
+        )
 
 
 def pull_and_extract_container_image(
@@ -1225,6 +1244,53 @@ def pull_and_extract_container_image(
             _remove_stale_deletions(images_dir)
 
 
+def _download_blobs(
+    digests: List[str],
+    base_url: str,
+    headers: Dict[str, str],
+    auth_header: Optional[str],
+    timeout_seconds: float,
+    blob_dir: str,
+) -> Iterator[BinaryIO]:
+    """Yield cached layers in manifest order while later layers download.
+
+    The caller closes each blob. Closing the generator stops outstanding
+    downloads and closes the blobs nobody took.
+    """
+    stop = threading.Event()
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_LAYER_DOWNLOADS, thread_name_prefix="sandbox-layer-download"
+    )
+    downloads = [
+        pool.submit(
+            layer_cache.fetch_blob,
+            blob_dir,
+            digest,
+            _registry_request(base_url + digest, headers, auth_header),
+            timeout_seconds,
+            stop,
+        )
+        for digest in digests
+    ]
+    yielded = 0
+    try:
+        for download in downloads:
+            blob = download.result()
+            yielded += 1
+            yield blob
+    finally:
+        stop.set()
+        for download in downloads[yielded:]:
+            download.cancel()
+            download.add_done_callback(_close_blob)
+        pool.shutdown(wait=False)
+
+
+def _close_blob(download: "concurrent.futures.Future[BinaryIO]") -> None:
+    if not download.cancelled() and download.exception() is None:
+        download.result().close()
+
+
 def _extract_image_layers(
     image: str,
     rootfs_dir: str,
@@ -1345,18 +1411,14 @@ def _extract_image_layers(
 
         digests = [layer["digest"] for layer in layers]
         base_url = f"{registry_base_url(registry)}/v2/{repo}/blobs/"
-        with layer_cache.fetch_blobs(
-            blob_dir,
-            digests,
-            lambda digest: _registry_request(base_url + digest, headers, auth_header),
-            timeout_seconds,
+        with contextlib.closing(
+            _download_blobs(
+                digests, base_url, headers, auth_header, timeout_seconds, blob_dir
+            )
         ) as blobs:
             for blob in blobs:
-                blob.seek(0)
-                extract_tar_layer(blob, rootfs_dir, ownership=ownership)
-        layer_cache.evict_least_recently_used_blobs(
-            blob_dir, layer_cache.layer_cache_max_bytes(blob_dir), keep=digests
-        )
+                with blob:
+                    extract_tar_layer(blob, rootfs_dir, ownership=ownership)
 
     except Exception as err:
         if isinstance(err, SandboxCreationError):

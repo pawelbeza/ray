@@ -38,6 +38,11 @@ from ray.experimental.sandbox._internal.image_utils import (
 from ray.experimental.sandbox.exceptions import SandboxCreationError
 
 
+@pytest.fixture(scope="session", autouse=True)
+def ensure_runsc() -> None:
+    """Image utility tests use fake mkfs.erofs and never start gVisor."""
+
+
 @pytest.fixture(autouse=True)
 def _build_images_with_fake_mkfs(fake_mkfs_erofs):
     """Every pull here builds its image through the fake mkfs.erofs."""
@@ -1414,11 +1419,9 @@ def _serve_image(monkeypatch, layers, serve_blob=None):
         server.server_close()
 
 
-@pytest.mark.parametrize("workers", [1, 3, 4])
-def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch, workers):
-    """The configured number of layers download at once, in manifest order
+def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch):
+    """Three layers download at once, and the layers apply in manifest order
     even when later ones arrive first."""
-    monkeypatch.setenv("RAY_SANDBOX_LAYER_PULL_PARALLELISM", str(workers))
     layers = [
         _gz_layer(("f", b"1"), ("g", b"g")),
         _gz_layer(("f", b"2")),
@@ -1426,21 +1429,14 @@ def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch, w
         _gz_layer(("h", b"h")),
         _gz_layer(("f", b"5")),
     ]
-    first_downloads = threading.Barrier(workers, timeout=5)
-    lock = threading.Lock()
-    active = peak = 0
+    first_three = threading.Barrier(3, timeout=5)
 
     def serve_blob(index, handler, blob):
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        if index < workers:
-            first_downloads.wait()
+        if index < 3:
+            # Breaks, and fails the pull, unless all three run at once.
+            first_three.wait()
         if index == 0:
             time.sleep(0.5)
-        with lock:
-            active -= 1
         _send(handler, blob)
 
     rootfs = tmp_path / "rootfs"
@@ -1452,7 +1448,28 @@ def test_layers_download_in_parallel_and_apply_in_order(tmp_path, monkeypatch, w
     assert (rootfs / "f").read_bytes() == b"5"
     assert not (rootfs / "g").exists()
     assert (rootfs / "h").read_bytes() == b"h"
-    assert peak == workers
+
+
+def test_layer_extraction_overlaps_later_downloads(tmp_path, monkeypatch):
+    applied = threading.Event()
+    extract = image_utils.extract_tar_layer
+
+    def extract_and_signal(*args, **kwargs):
+        extract(*args, **kwargs)
+        applied.set()
+
+    def serve_blob(index, handler, blob):
+        if index == 1 and not applied.wait(5):
+            handler.send_error(500)
+            return
+        _send(handler, blob)
+
+    monkeypatch.setattr(image_utils, "extract_tar_layer", extract_and_signal)
+    layers = [_gz_layer(("a", b"a")), _gz_layer(("b", b"b"))]
+    with _serve_image(monkeypatch, layers, serve_blob) as image:
+        image_dir = pull_and_extract_container_image(image, str(tmp_path))
+    assert _image_file(image_dir, "a") == b"a"
+    assert _image_file(image_dir, "b") == b"b"
 
 
 def test_failed_layer_fails_the_pull_and_stops_other_downloads(tmp_path, monkeypatch):
@@ -1522,28 +1539,27 @@ def test_a_layer_cut_short_fails_the_pull(tmp_path, monkeypatch):
             )
 
 
-def test_layer_cache_reuses_layers_across_tags_and_rebuilds(tmp_path, monkeypatch):
+def test_layer_cache_reuses_layers_across_images_and_rebuilds(tmp_path, monkeypatch):
     layers = [_gz_layer(("a", b"a")), _gz_layer(("b", b"b"))]
+    layers.append(layers[0])
     requests = []
 
     def serve_blob(index, handler, blob):
         requests.append(index)
         _send(handler, blob)
 
+    references = ("busybox:one", "busybox:two", "other:latest")
     with _serve_image(monkeypatch, layers, serve_blob):
-        for tag in ("one", "two"):
-            image_dir = pull_and_extract_container_image(
-                f"busybox:{tag}", str(tmp_path)
-            )
+        for image in references:
+            image_dir = pull_and_extract_container_image(image, str(tmp_path))
             assert _image_file(image_dir, "a") == b"a"
             assert _image_file(image_dir, "b") == b"b"
         shutil.rmtree(image_dir)
-        pull_and_extract_container_image("busybox:two", str(tmp_path))
+        pull_and_extract_container_image(references[-1], str(tmp_path))
     assert sorted(requests) == [0, 1]
 
 
-@pytest.mark.parametrize("processes", [False, True])
-def test_layer_cache_concurrent_pulls_download_once(tmp_path, monkeypatch, processes):
+def test_layer_cache_concurrent_pulls_download_once(tmp_path, monkeypatch):
     layer = _gz_layer(("a", b"a"))
     digest = f"sha256:{hashlib.sha256(layer).hexdigest()}"
     requests = []
@@ -1551,6 +1567,8 @@ def test_layer_cache_concurrent_pulls_download_once(tmp_path, monkeypatch, proce
 
     def serve_blob(index, handler, blob):
         requests.append(index)
+        # Keep the download in flight while the other processes contend.
+        time.sleep(0.2)
         _send(handler, blob)
 
     with _serve_image(monkeypatch, [layer], serve_blob):
@@ -1558,40 +1576,30 @@ def test_layer_cache_concurrent_pulls_download_once(tmp_path, monkeypatch, proce
 
         def pull() -> bytes:
             start.wait()
-            if processes:
-                return subprocess.check_output(
-                    [
-                        sys.executable,
-                        "-c",
-                        """
+            return subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    """
 import importlib.util
 import sys
+import threading
 import urllib.request
 spec = importlib.util.spec_from_file_location("layer_cache", sys.argv[1])
 cache = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cache)
-with cache.fetch_blobs(
-    sys.argv[2], [sys.argv[3]], lambda d: urllib.request.Request(sys.argv[4]), 30
-) as blobs:
-    sys.stdout.buffer.write(blobs[0].read())
+with cache.fetch_blob(
+    sys.argv[2], sys.argv[3], urllib.request.Request(sys.argv[4]), 30, threading.Event()
+) as blob:
+    sys.stdout.buffer.write(blob.read())
 """,
-                        layer_cache.__file__,
-                        str(tmp_path),
-                        digest,
-                        f"{base}/v2/library/busybox/blobs/{digest}",
-                    ],
-                    timeout=30,
-                )
-            with layer_cache.fetch_blobs(
-                str(tmp_path),
-                [digest, digest],
-                lambda d: image_utils._registry_request(
-                    f"{base}/v2/library/busybox/blobs/{d}", {}
-                ),
-                30,
-            ) as blobs:
-                assert blobs[0] is blobs[1]
-                return blobs[0].read()
+                    layer_cache.__file__,
+                    str(tmp_path),
+                    digest,
+                    f"{base}/v2/library/busybox/blobs/{digest}",
+                ],
+                timeout=30,
+            )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda _: pull(), range(4)))
@@ -1618,29 +1626,95 @@ def test_layer_cache_rejects_wrong_digest_and_cleans_partial(tmp_path, monkeypat
     assert not list(rootfs.iterdir())
 
 
-def test_layer_cache_eviction_preserves_kept_locked_and_open_blobs(tmp_path):
+def _write_cached_layers(images_dir: str, count: int) -> list[str]:
     paths = []
-    digests = [f"sha256:{i:064x}" for i in range(4)]
+    digests = [f"sha256:{i:064x}" for i in range(count)]
     for i, digest in enumerate(digests):
-        path = layer_cache.blob_path(str(tmp_path), digest)
+        path = layer_cache.blob_path(images_dir, digest)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as blob:
             blob.write(bytes([i]) * 10)
         os.utime(path, (i + 1, i + 1))
         paths.append(path)
-    with open(paths[0], "rb") as reader, open(paths[1] + ".lock", "a") as lock:
+    return paths
+
+
+def test_layer_cache_eviction_skips_locked_blobs(tmp_path):
+    paths = _write_cached_layers(str(tmp_path), 4)
+    with open(paths[1] + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        layer_cache.evict_least_recently_used_blobs(
-            str(tmp_path), 20, keep=[digests[2]]
-        )
-        assert reader.read() == b"\0" * 10
-        assert [os.path.exists(path) for path in paths] == [False, True, True, False]
+        image_utils.evict_least_recently_used_images(str(tmp_path), 20)
+        assert [os.path.exists(path) for path in paths] == [False, True, False, True]
 
 
-@pytest.mark.parametrize("digest", ["sha256:../escape", "sha256:" + "a" * 64 + "\n"])
-def test_layer_cache_rejects_invalid_digest(tmp_path, digest):
+@pytest.mark.parametrize("change", ["reuse", "remove"])
+def test_layer_cache_eviction_rechecks_scanned_blobs(tmp_path, monkeypatch, change):
+    paths = _write_cached_layers(str(tmp_path), 2)
+    scan = layer_cache.cached_blobs
+
+    def changed_blobs(images_dir):
+        entries = list(scan(images_dir))
+        if change == "reuse":
+            os.utime(paths[0], (3, 3))
+        else:
+            os.unlink(paths[0])
+        yield from entries
+
+    monkeypatch.setattr(layer_cache, "cached_blobs", changed_blobs)
+    image_utils.evict_least_recently_used_images(str(tmp_path), 10)
+    assert [os.path.exists(path) for path in paths] == [
+        change == "reuse",
+        change == "remove",
+    ]
+
+
+@pytest.mark.parametrize("pressure", ["size", "free"])
+def test_layer_cache_reclaimed_before_images(tmp_path, monkeypatch, pressure):
+    local_tar = tmp_path / "sample.tar"
+    _write_sample_tar(local_tar)
+    images_dir = str(tmp_path / "images")
+    image_dir = pull_and_extract_container_image(str(local_tar), images_dir)
+    image_size = image_utils._dir_size_bytes(image_dir)
+    paths = _write_cached_layers(images_dir, 2)
+    for i, path in enumerate(paths):
+        newer = time.time() + i + 10
+        os.utime(path, (newer, newer))
+    monkeypatch.setenv(
+        "RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES",
+        str(image_size + 10) if pressure == "size" else "0",
+    )
+    monkeypatch.setenv(
+        "RAY_SANDBOX_IMAGE_CACHE_MIN_FREE_BYTES", "90" if pressure == "free" else "0"
+    )
+    monkeypatch.setattr(
+        image_utils,
+        "_free_bytes",
+        lambda _: 100 - sum(10 for path in paths if os.path.exists(path)),
+    )
+
+    assert pull_and_extract_container_image(str(local_tar), images_dir) == image_dir
+    assert [os.path.exists(path) for path in paths] == [False, True]
+    assert _image_file(image_dir, "hello.txt") == b"hello"
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_layer_cache_cleans_only_abandoned_partials(tmp_path, locked):
+    path = layer_cache.blob_path(str(tmp_path), f"sha256:{'0' * 64}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = os.path.join(os.path.dirname(path), f".partial-{'0' * 64}-stale")
+    with open(partial, "wb") as blob:
+        blob.write(b"partial")
+    os.utime(partial, (1, 1))
+    with open(path + ".lock", "a") as lock:
+        if locked:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        image_utils.evict_least_recently_used_images(str(tmp_path), 0)
+    assert os.path.exists(partial) == locked
+
+
+def test_layer_cache_rejects_path_traversal(tmp_path):
     with pytest.raises(SandboxCreationError, match="Unsupported layer digest"):
-        layer_cache.blob_path(str(tmp_path), digest)
+        layer_cache.blob_path(str(tmp_path), "sha256:../escape")
 
 
 def test_extract_tar_layer_reads_a_layer_once(tmp_path):

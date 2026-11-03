@@ -603,13 +603,11 @@ The role needs `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, and `ecr:GetDow
 
 ### Bound the image cache
 
-The cache is bounded so that a node that runs many distinct images doesn't fill its disk. Before each pull, Ray evicts the least recently extracted images until the cache fits under the cap and the filesystem that holds the cache has a minimum of free space, so the cache gives way when sandboxes' writable overlays, logs, or spilled objects fill the disk. Images that a running sandbox uses are never evicted. The cap defaults to half of the filesystem and the free-space floor to a tenth of it, the level at which the kubelet starts evicting Pods. Set `RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES` and `RAY_SANDBOX_IMAGE_CACHE_MIN_FREE_BYTES` on worker nodes to choose either in bytes, or set both to `0` to disable eviction.
+The cache bounds both EROFS images and downloaded layers so that a node that runs many distinct images doesn't fill its disk. Before each pull, Ray evicts the least recently used layers, then the least recently extracted images until the combined cache fits under the cap and the filesystem that holds the cache has a minimum of free space. The cache gives way when sandboxes' writable overlays, logs, or spilled objects fill the disk. Images that a running sandbox uses are never evicted. The cap defaults to half of the filesystem and the free-space floor to a tenth of it, the level at which the kubelet starts evicting Pods. Set `RAY_SANDBOX_IMAGE_CACHE_MAX_BYTES` and `RAY_SANDBOX_IMAGE_CACHE_MIN_FREE_BYTES` on worker nodes to choose either in bytes, or set both to `0` to disable eviction.
 
 ### Layer cache
 
-Image layers download into `/tmp/ray/sandbox/images/blobs/sha256/<digest>`, verified against their digest, and every image that uses a layer builds its root filesystem from that file. Tags of one image, and images built on one base, share their common layers. Rebuilding an evicted image downloads only layers the node no longer has. Layers download concurrently, `RAY_SANDBOX_LAYER_PULL_PARALLELISM` (default 4) at a time. Concurrent pulls of the same layer, from any process on the node, download it once.
-
-Ray evicts least recently used layers once the layer cache exceeds `RAY_SANDBOX_LAYER_CACHE_MAX_BYTES`, which defaults to a quarter of the filesystem that holds it; `0` disables eviction. Layers used by the current pull stay cached even if they exceed the cap. A cached image's EROFS file doesn't depend on its layers, so evicting layers never affects a running sandbox.
+Ray verifies downloaded image layers against their digests and stores them in `/tmp/ray/sandbox/images/blobs/sha256/<digest>`. Images and tags that share layers reuse these files. Rebuilding an evicted image downloads only layers the node no longer has. Concurrent pulls of the same layer, from any process on the node, download it once. A cached image's EROFS file doesn't depend on its layers, so evicting layers doesn't affect a running sandbox.
 
 ### Route Docker Hub pulls through a mirror
 
